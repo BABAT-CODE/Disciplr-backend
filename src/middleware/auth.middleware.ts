@@ -18,7 +18,7 @@ export const authenticate = async (req: Request, res: Response, next: NextFuncti
             userId: payload.userId,
             role: payload.role as UserRole,
         }
-        const isValid = await validateSession(payload.jti)
+        const isValid = await validateSession(payload.jti || '')
         if (!isValid) return res.status(401).json({ error: 'Unauthorized: Session revoked' })
         next()
     } catch (error) {

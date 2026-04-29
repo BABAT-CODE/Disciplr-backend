@@ -98,7 +98,7 @@ export function validateHorizonListenerConfig(config: HorizonListenerConfig): vo
     errors.push('HORIZON_SHUTDOWN_TIMEOUT_MS must be a positive integer')
   }
 
-  if (isNaN(config.lagThreshold) || config.lagThreshold < 0) {
+  if (config.lagThreshold !== undefined && (isNaN(config.lagThreshold) || config.lagThreshold < 0)) {
     errors.push('HORIZON_LAG_THRESHOLD must be a non-negative integer')
   }
 
