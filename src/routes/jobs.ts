@@ -97,7 +97,7 @@ export const createJobsRouter = (jobSystem: BackgroundJobSystem, options: JobsRo
 
   // All jobs endpoints require an authenticated admin
   jobsRouter.use(authenticate)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+   
   jobsRouter.use(authorize([UserRole.ADMIN]))
 
   // GET /metrics — internal queue metrics (admin only)
