@@ -1,5 +1,21 @@
-use soroban_sdk::{Env, String, Vec};
-use accountability_vault::{Contract, Error, Milestone};
+#![cfg(test)]
+
+extern crate std;
+
+use super::*;
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    token, vec, Address, Env, String,
+};
+
+fn create_token(env: &Env, admin: &Address) -> (Address, token::StellarAssetClient<'static>) {
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let address = sac.address();
+    (
+        address.clone(),
+        token::StellarAssetClient::new(env, &address),
+    )
+}
 
 struct Setup {
     env: Env,
@@ -118,6 +134,8 @@ fn test_withdraw_draft_cancels() {
     assert_eq!(vault.status, VaultStatus::Cancelled);
 }
 
+// ── cross-feature: stake_from then oracle check_in then claim ────────────────
+
 #[test]
 #[should_panic]
 fn test_claim_before_all_verified_fails() {
@@ -135,3 +153,6 @@ fn test_slash_before_deadline_fails() {
     s.contract.stake(&s.creator);
     s.contract.slash_on_miss();
 }
+
+
+
