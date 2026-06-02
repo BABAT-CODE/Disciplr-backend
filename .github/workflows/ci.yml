@@ -49,6 +49,11 @@ jobs:
       - name: Migration status
         run: npm run migrate:status
 
+      - name: Assert migration status is clean
+        run: |
+          npm run migrate:status | tee /tmp/migrate-status.txt
+          grep -q 'Found 0 Pending Migration file/files.' /tmp/migrate-status.txt
+
   security-scan:
     runs-on: ubuntu-latest
     steps:

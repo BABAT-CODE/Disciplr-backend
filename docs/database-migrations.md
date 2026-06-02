@@ -15,6 +15,12 @@ This backend uses **Knex + PostgreSQL** for schema migrations.
 - Migration tracking table: `knex_migrations`
 - Connection source: `DATABASE_URL`
 
+## Legacy SQL migration cleanup
+
+The legacy SQL files under `src/db/migrations/` are deprecated and no longer authoritative. All required schema changes are now tracked in `db/migrations/`.
+
+The `db/migrations/20260501000000_create_api_keys_and_idempotency_keys.cjs` migration brings `api_keys` and `idempotency_keys` into the canonical Knex-managed migration flow.
+
 ## Baseline migration
 
 - Baseline file: `db/migrations/20260225190000_initial_baseline.cjs`
@@ -62,6 +68,7 @@ This repository includes a CI example at `.github/workflows/ci.yml` that:
 - starts PostgreSQL in GitHub Actions
 - runs `npm run migrate:latest`
 - verifies state with `npm run migrate:status`
+- asserts migrations are clean with no pending files after application
 
 Example deployment step:
 
