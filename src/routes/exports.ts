@@ -18,6 +18,7 @@ import {
 } from '../services/exportQueue.js'
 import { checkAndIncrementExportQuota } from '../services/exportQuota.js'
 import { getEnv } from '../config/index.js'
+import { resolveS3Config, getExportSignedUrl } from '../services/exportS3.js'
 
 const resolveOrgId = (req: AuthenticatedRequest): string =>
   (req as any).orgId as string | undefined ?? req.user!.userId
@@ -145,6 +146,22 @@ export function createExportRouter(jobSystem: BackgroundJobSystem): Router {
         attempts: job.attempts,
         maxAttempts: job.maxAttempts,
         ...(job.error ? { error: job.error } : {}),
+      })
+      return
+    }
+
+    const s3Config = resolveS3Config()
+
+    if (s3Config && job.s3Key) {
+      const signedUrl = await getExportSignedUrl(s3Config, job.s3Key)
+      res.json({
+        jobId: job.id,
+        status: 'done',
+        attempts: job.attempts,
+        maxAttempts: job.maxAttempts,
+        completedAt: job.completedAt,
+        downloadUrl: signedUrl,
+        expiresInSeconds: s3Config.signedUrlTtlSeconds,
       })
       return
     }
