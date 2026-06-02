@@ -325,7 +325,11 @@ export class InMemoryJobQueue {
       this.recordCompletedJob(job, Date.now() - startedAt)
     } catch (error) {
       const message = getErrorMessage(error)
-      if (job.attempt < job.maxAttempts) {
+
+      // If the handler marked the error as non-retryable, record failure and skip retry
+      if (error && (error as any).nonRetryable) {
+        this.recordFailedJob(job, message)
+      } else if (job.attempt < job.maxAttempts) {
         this.totals.retried += 1
         job.runAt = Date.now() + this.getRetryDelayMs(job.attempt)
         this.pendingJobs.push(job)
@@ -393,6 +397,64 @@ export class InMemoryJobQueue {
 
     const entry = this.deadLetterJobs.splice(index, 1)[0]
     return this.enqueue(entry.type, entry.payload, { maxAttempts: entry.maxAttempts })
+  }
+
+  retryJob(jobId: string, force: boolean = false): QueuedJobReceipt<JobType> {
+    const deadLetterIndex = this.deadLetterJobs.findIndex((entry) => entry.jobId === jobId)
+    if (deadLetterIndex !== -1) {
+      const entry = this.deadLetterJobs[deadLetterIndex]
+      if (!force) {
+        throw new Error('max_attempts is exhausted. Use ?force=true to retry anyway.')
+      }
+
+      this.deadLetterJobs.splice(deadLetterIndex, 1)
+
+      const job: InternalQueuedJob<JobType> = {
+        id: entry.jobId,
+        type: entry.type,
+        payload: entry.payload,
+        attempt: 0,
+        maxAttempts: entry.maxAttempts,
+        createdAt: entry.createdAt,
+        runAt: Date.now(),
+      }
+
+      this.pendingJobs.push(job)
+      this.sortPendingJobs()
+
+      if (this.running) {
+        void this.drain()
+      }
+
+      return {
+        id: job.id,
+        type: job.type,
+        runAt: new Date(job.runAt).toISOString(),
+        maxAttempts: job.maxAttempts,
+      }
+    }
+
+    const pendingIndex = this.pendingJobs.findIndex((job) => job.id === jobId)
+    if (pendingIndex !== -1) {
+      const job = this.pendingJobs[pendingIndex]
+      if (job.attempt > 0) {
+        job.runAt = Date.now()
+        this.sortPendingJobs()
+        
+        if (this.running) {
+          void this.drain()
+        }
+
+        return {
+          id: job.id,
+          type: job.type,
+          runAt: new Date(job.runAt).toISOString(),
+          maxAttempts: job.maxAttempts,
+        }
+      }
+    }
+
+    throw new Error('Job not found or not in a failed state')
   }
 
   private trimHistory(records: unknown[]): void {
