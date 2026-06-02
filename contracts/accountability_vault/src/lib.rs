@@ -73,8 +73,8 @@ impl AccountabilityVaultContract {
 //!   (`"oracle"` vs `"verifier"`) is included in the emitted event for backend parsing.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
-    String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN,
+    Env, String, Symbol, Vec,
 };
 
 /// Maximum allowed horizon between vault creation and its deadline.
@@ -88,11 +88,12 @@ const MAX_DEADLINE_HORIZON: u64 = 5 * 365 * 24 * 60 * 60;
 #[derive(Clone)]
 pub enum DataKey {
     /// The vault configuration and current state.
-    Vault,
+    Vault(String),
     /// Per-milestone check-in timestamp (set when the milestone reaches the approval threshold).
     CheckIn(u32),
     /// Per-milestone list of addresses that have approved, used for M-of-N tracking.
-    MilestoneApprovals(u32),\n    DisputeWindow,
+    MilestoneApprovals(u32),
+    DisputeWindow,
 }
 
 /// Lifecycle state of the vault, mirroring the backend `PersistedVault.status`.
@@ -308,6 +309,7 @@ impl AccountabilityVault {
         }
 
         let mut sum: i128 = 0;
+        let mut prev_due_date: Option<u64> = None;
         for m in milestones.iter() {
             if m.amount <= 0 || m.amount > MAX_AMOUNT_PER_MILESTONE {
                 return Err(Error::InvalidAmount);
@@ -315,6 +317,12 @@ impl AccountabilityVault {
             if m.due_date > end_timestamp {
                 return Err(Error::InvalidDeadline);
             }
+            if let Some(prev) = prev_due_date {
+                if m.due_date <= prev {
+                    return Err(Error::InvalidDeadline);
+                }
+            }
+            prev_due_date = Some(m.due_date);
             sum += m.amount;
         }
         if sum != amount {
@@ -364,7 +372,11 @@ impl AccountabilityVault {
     /// correctly account for fee-on-transfer tokens. If the received amount is
     /// less than the declared `vault.amount`, the call is rejected with
     /// `Error::AmountMismatch`.
-    pub fn stake(env: Env, vault_id: String, from: Address) -> Result<(), Error> {
+    pub fn stake(
+        env: Env,
+        vault_id: String,
+        from: Address,
+    ) -> Result<(), Error> {
         from.require_auth();
         let mut vault: Vault = Self::load(&env, &vault_id)?;
 
@@ -473,6 +485,7 @@ impl AccountabilityVault {
     /// human verifier sign-offs.
     pub fn check_in(
         env: Env,
+        vault_id: String,
         caller: Address,
         milestone_index: u32,
         evidence_hash: BytesN<32>,
@@ -569,7 +582,7 @@ impl AccountabilityVault {
         new_end_timestamp: u64,
     ) -> Result<(), Error> {
         creator.require_auth();
-        let mut vault: Vault = Self::load(&env)?;
+        let mut vault: Vault = Self::load(&env, &vault_id)?;
 
         if creator != vault.creator {
             return Err(Error::Unauthorized);
@@ -615,8 +628,8 @@ impl AccountabilityVault {
     /// Checks-Effects-Interactions: vault status is set to `Failed` and `staked`
     /// is zeroed in storage BEFORE the external token transfer is executed,
     /// ensuring the terminal state is committed even if the transfer call panics.
-    pub fn slash_on_miss(env: Env) -> Result<(), Error> {
-        let mut vault: Vault = Self::load(&env)?;
+    pub fn slash_on_miss(env: Env, vault_id: String) -> Result<(), Error> {
+        let mut vault: Vault = Self::load(&env, &vault_id)?;
 
         // Check Disputed before NotActive so callers get the specific error code.
         if vault.status == VaultStatus::Disputed {
@@ -641,7 +654,7 @@ impl AccountabilityVault {
         let token_addr = vault.token.clone();
         vault.status = VaultStatus::Failed;
         vault.staked = 0;
-        env.storage().instance().set(&DataKey::Vault, &vault);
+        env.storage().instance().set(&DataKey::Vault(vault_id), &vault);
 
         token::Client::new(&env, &token_addr).transfer(
             &env.current_contract_address(),
@@ -666,7 +679,7 @@ impl AccountabilityVault {
     /// Checks-Effects-Interactions: vault status is set to `Completed` and
     /// `staked` is zeroed in storage BEFORE the external token transfer,
     /// ensuring the terminal state is committed even if the transfer call panics.
-    pub fn claim(env: Env, caller: Address) -> Result<(), Error> {
+    pub fn claim(env: Env, vault_id: String, caller: Address) -> Result<(), Error> {
         caller.require_auth();
         let mut vault: Vault = Self::load(&env, &vault_id)?;
 
@@ -700,7 +713,7 @@ impl AccountabilityVault {
         let token_addr = vault.token.clone();
         vault.status = VaultStatus::Completed;
         vault.staked = 0;
-        env.storage().instance().set(&DataKey::Vault, &vault);
+        env.storage().instance().set(&DataKey::Vault(vault_id), &vault);
 
         token::Client::new(&env, &token_addr).transfer(
             &env.current_contract_address(),
@@ -726,14 +739,20 @@ impl AccountabilityVault {
     ///
     /// When the last milestone is claimed, the vault automatically transitions
     /// to `Completed`.
-    pub fn claim_milestone(env: Env, caller: Address, index: u32) -> Result<(), Error> {
+    pub fn claim_milestone(
+        env: Env,
+        vault_id: String,
+        caller: Address,
+        index: u32,
+    ) -> Result<(), Error> {
         caller.require_auth();
-        let mut vault: Vault = Self::load(&env)?;
+        let mut vault: Vault = Self::load(&env, &vault_id)?;
 
         if vault.status != VaultStatus::Active {
             return Err(Error::NotActive);
         }
-        if caller != vault.creator && caller != vault.verifier {
+        let is_authorized = caller == vault.creator || vault.verifiers.iter().any(|v| v == caller);
+        if !is_authorized {
             return Err(Error::Unauthorized);
         }
         if index >= vault.milestones.len() {
@@ -785,7 +804,7 @@ impl AccountabilityVault {
             );
         }
 
-        env.storage().instance().set(&DataKey::Vault, &vault);
+        env.storage().instance().set(&DataKey::Vault(vault_id), &vault);
         Ok(())
     }
 
@@ -931,15 +950,19 @@ impl AccountabilityVault {
     ///
     /// Only the `guardian` address set at vault creation may call this function.
     /// Use to halt settlement during disputes or detected incidents.
-    pub fn emergency_pause(env: Env, guardian: Address) -> Result<(), Error> {
+    pub fn emergency_pause(
+        env: Env,
+        vault_id: String,
+        guardian: Address,
+    ) -> Result<(), Error> {
         guardian.require_auth();
-        let mut vault: Vault = Self::load(&env)?;
+        let mut vault: Vault = Self::load(&env, &vault_id)?;
 
         if guardian != vault.guardian {
             return Err(Error::Unauthorized);
         }
         vault.paused = true;
-        env.storage().instance().set(&DataKey::Vault, &vault);
+        env.storage().instance().set(&DataKey::Vault(vault_id), &vault);
         env.events()
             .publish((Symbol::new(&env, "vault_paused"), guardian), true);
         Ok(())
@@ -948,15 +971,19 @@ impl AccountabilityVault {
     /// Unpauses the vault, re-enabling `slash_on_miss`, `claim`, and `withdraw`.
     ///
     /// Only the `guardian` address set at vault creation may call this function.
-    pub fn emergency_unpause(env: Env, guardian: Address) -> Result<(), Error> {
+    pub fn emergency_unpause(
+        env: Env,
+        vault_id: String,
+        guardian: Address,
+    ) -> Result<(), Error> {
         guardian.require_auth();
-        let mut vault: Vault = Self::load(&env)?;
+        let mut vault: Vault = Self::load(&env, &vault_id)?;
 
         if guardian != vault.guardian {
             return Err(Error::Unauthorized);
         }
         vault.paused = false;
-        env.storage().instance().set(&DataKey::Vault, &vault);
+        env.storage().instance().set(&DataKey::Vault(vault_id), &vault);
         env.events()
             .publish((Symbol::new(&env, "vault_unpaused"), guardian), false);
         Ok(())
@@ -970,8 +997,8 @@ impl AccountabilityVault {
     /// Sweeps any residual token balance held by the contract to the vault creator
     /// after a terminal settlement. Only the creator may call this, and only once
     /// `staked` has been zeroed by `claim`, `slash_on_miss`, or `withdraw`.
-    pub fn reclaim_after_settlement(env: Env, token_address: Address) -> Result<(), Error> {
-        let vault: Vault = Self::load(&env)?;
+    pub fn reclaim_after_settlement(env: Env, vault_id: String, token_address: Address) -> Result<(), Error> {
+        let vault: Vault = Self::load(&env, &vault_id)?;
         vault.creator.require_auth();
 
         // Only sweep after the vault has no outstanding stake.
@@ -1029,7 +1056,7 @@ impl AccountabilityVault {
         
         Ok(())
     }
-\n    fn load(env: &Env, vault_id: &String) -> Result<Vault, Error> {
+    fn load(env: &Env, vault_id: &String) -> Result<Vault, Error> {
         let key = DataKey::Vault(vault_id.clone());
         let vault = env
             .storage()
@@ -1067,6 +1094,24 @@ impl AccountabilityVault {
     fn any_verified(vault: &Vault) -> bool {
         for m in vault.milestones.iter() {
             if m.verified {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn all_released(vault: &Vault) -> bool {
+        for m in vault.milestones.iter() {
+            if !m.released {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn any_released(vault: &Vault) -> bool {
+        for m in vault.milestones.iter() {
+            if m.released {
                 return true;
             }
         }
