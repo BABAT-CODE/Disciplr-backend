@@ -1,4 +1,4 @@
-import { prisma } from '../lib/prisma.js'
+import { getPrisma } from '../lib/prismaScope.js'
 import { hashPassword, comparePassword, generateAccessToken, generateRefreshToken, verifyRefreshToken, hashToken } from '../lib/auth-utils.js'
 import { RegisterInput, LoginInput } from '../lib/validation.js'
 import { UserRole } from '../types/user.js'
@@ -9,7 +9,7 @@ export class AuthService {
     static async register(input: RegisterInput) {
         try {
             const hashedPassword = await hashPassword(input.password)
-            const user = await prisma.user.create({
+            const user = await getPrisma().user.create({
                 data: {
                     email: input.email,
                     passwordHash: hashedPassword,
@@ -27,6 +27,7 @@ export class AuthService {
     }
 
     static async login(input: LoginInput) {
+        const prisma = getPrisma()
         const user = await prisma.user.findUnique({ where: { email: input.email } })
         if (!user) {
             throw new Error('Invalid credentials')
@@ -37,31 +38,38 @@ export class AuthService {
             throw new Error('Invalid credentials')
         }
 
-        await prisma.user.update({
-            where: { id: user.id },
-            data: { lastLoginAt: new Date() },
-        })
-
         const jti = randomUUID()
+        const sessionId = randomUUID()
+        const lastLoginAt = new Date()
         const accessToken = generateAccessToken({ userId: user.id, role: user.role, jti })
         const refreshTokenValue = generateRefreshToken({ userId: user.id })
-
-        // 1. Record session for access token (middleware/auth.ts compatibility)
         const accessExpiresAt = new Date(Date.now() + 15 * 60 * 1000) // 15 minutes
-        await recordSession(user.id, jti, accessExpiresAt)
-
-        // 2. Store hashed refresh token — the raw value is only returned to the client
         const tokenHash = hashToken(refreshTokenValue)
-        await prisma.refreshToken.create({
-            data: {
-                token: tokenHash,
-                userId: user.id,
-                expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
-            },
+
+        const loggedInUser = await prisma.$transaction(async (tx) => {
+            const updatedUser = await tx.user.update({
+                where: { id: user.id },
+                data: { lastLoginAt },
+            })
+
+            await tx.$executeRaw`
+                INSERT INTO "sessions" ("id", "user_id", "jti", "expires_at")
+                VALUES (${sessionId}, ${user.id}, ${jti}, ${accessExpiresAt})
+            `
+
+            await tx.refreshToken.create({
+                data: {
+                    token: tokenHash,
+                    userId: user.id,
+                    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
+                },
+            })
+
+            return updatedUser
         })
 
         return {
-            user: { id: user.id, email: user.email, role: user.role },
+            user: { id: loggedInUser.id, email: loggedInUser.email, role: loggedInUser.role },
             accessToken,
             refreshToken: refreshTokenValue,
         }
@@ -73,7 +81,7 @@ export class AuthService {
 
             // Look up by hash — we never store the raw token
             const tokenHash = hashToken(token)
-            const storedToken = await prisma.refreshToken.findUnique({
+            const storedToken = await getPrisma().refreshToken.findUnique({
                 where: { token: tokenHash },
                 include: { user: true },
             })
@@ -83,7 +91,7 @@ export class AuthService {
             }
 
             // Revoke old token BEFORE issuing new ones (no dual-valid window)
-            await prisma.refreshToken.update({
+            await getPrisma().refreshToken.update({
                 where: { id: storedToken.id },
                 data: { revokedAt: new Date() },
             })
@@ -98,7 +106,7 @@ export class AuthService {
 
             // 2. Store hashed new refresh token
             const newTokenHash = hashToken(newRefreshTokenValue)
-            await prisma.refreshToken.create({
+            await getPrisma().refreshToken.create({
                 data: {
                     token: newTokenHash,
                     userId: storedToken.user.id,
@@ -117,7 +125,7 @@ export class AuthService {
 
     static async logout(token: string) {
         const tokenHash = hashToken(token)
-        await prisma.refreshToken.updateMany({
+        await getPrisma().refreshToken.updateMany({
             where: { token: tokenHash },
             data: { revokedAt: new Date() },
         })
@@ -129,7 +137,7 @@ export class AuthService {
      */
     static async logoutAll(userId: string) {
         // 1. Revoke all refresh tokens for this user
-        await prisma.refreshToken.updateMany({
+        await getPrisma().refreshToken.updateMany({
             where: { userId, revokedAt: null },
             data: { revokedAt: new Date() },
         })

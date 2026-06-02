@@ -22,17 +22,30 @@ import { adminVerifiersRouter } from './routes/adminVerifiers.js'
 import { verificationsRouter } from './routes/verifications.js'
 import { apiKeysRouter } from './routes/apiKeys.js'
 import { notificationsRouter } from './routes/notifications.js'
+import { withRequestPrisma } from './middleware/withRequestPrisma.js'
 import {
   securityMetricsMiddleware,
   securityRateLimitMiddleware,
 } from './security/abuse-monitor.js'
+import inFlightMiddleware from './middleware/inFlightRequests.js'
 
-export function bootstrapApp() {
-  const jobSystem = new BackgroundJobSystem()
+type BootstrapOptions = {
+  notificationService?: NotificationService
+  notificationProviderName?: string
+}
+
+export function bootstrapApp(options: BootstrapOptions = {}) {
+  const notificationService =
+    options.notificationService ??
+    createNotificationService(options.notificationProviderName ?? process.env.NOTIFICATION_PROVIDER ?? 'console')
+  const jobSystem = new BackgroundJobSystem(notificationService)
   configureExportJobRepository(createKnexExportJobRepository(db))
 
   app.use(securityMetricsMiddleware)
   app.use(securityRateLimitMiddleware)
+  // Track in-flight requests for graceful shutdown
+  app.use(inFlightMiddleware)
+  app.use(withRequestPrisma)
 
   app.use('/api/health', healthRateLimiter, createHealthRouter(jobSystem))
   app.use('/api/jobs', createJobsRouter(jobSystem))
