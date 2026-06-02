@@ -79,6 +79,43 @@ export interface StakeResponse {
   }
 }
 
+export interface StakeWithMemoInput {
+  vaultId: string
+  amount: string
+  user: string
+  memo?: string
+  onChain?: {
+    mode?: 'build' | 'submit'
+    contractId?: string
+    networkPassphrase?: string
+    sourceAccount?: string
+  }
+}
+
+export interface StakeWithMemoResponse {
+  mode: 'build' | 'submit'
+  payload: {
+    contractId: string
+    networkPassphrase: string
+    sourceAccount: string
+    method: 'stake_with_memo'
+    args: Record<string, unknown>
+  }
+  submission: {
+    attempted: boolean
+    status: 'not_requested' | 'not_configured' | 'success' | 'error'
+    txHash?: string
+    error?: string
+  }
+}
+
+export class MemoTooLongError extends Error {
+  constructor(bytes: number, max: number) {
+    super(`Memo exceeds maximum length: ${bytes} bytes > ${max} bytes`)
+    this.name = 'MemoTooLongError'
+  }
+}
+
 export interface VaultCreateResponse {
   vault: PersistedVault
   onChain: {

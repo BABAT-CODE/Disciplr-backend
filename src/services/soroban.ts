@@ -3,8 +3,11 @@ import type {
   PersistedVault,
   StakeInput,
   StakeResponse,
+  StakeWithMemoInput,
+  StakeWithMemoResponse,
   VaultCreateResponse,
 } from '../types/vaults.js'
+import { MemoTooLongError } from '../types/vaults.js'
 
 const DEFAULT_CONTRACT_ID = 'CONTRACT_ID_NOT_CONFIGURED'
 const DEFAULT_SOURCE_ACCOUNT = 'SOURCE_ACCOUNT_NOT_CONFIGURED'
@@ -43,6 +46,9 @@ export const getSorobanConfig = (): SorobanConfig | null => {
  */
 export const isSorobanSubmitEnabled = (): boolean => getSorobanConfig() !== null
 
+/** Maximum memo payload in bytes (contract-enforced cap). */
+export const MEMO_MAX_BYTES = 64
+
 // ─── Soroban SDK abstraction (mockable for tests) ───────────────────────────
 
 /**
@@ -56,6 +62,11 @@ export interface SorobanClient {
   ): Promise<{ txHash: string }>
 
   submitStake(
+    config: SorobanConfig,
+    args: Record<string, unknown>,
+  ): Promise<{ txHash: string }>
+
+  submitStakeWithMemo(
     config: SorobanConfig,
     args: Record<string, unknown>,
   ): Promise<{ txHash: string }>
@@ -183,6 +194,63 @@ export const defaultSorobanClient: SorobanClient = {
 
     return { txHash: response.hash }
   },
+
+  async submitStakeWithMemo(config, args) {
+    const {
+      Keypair,
+      Contract,
+      rpc: SorobanRpc,
+      Networks,
+      TransactionBuilder,
+      nativeToScVal,
+      BASE_FEE,
+    } = await import('@stellar/stellar-sdk')
+
+    const server = new SorobanRpc.Server(config.rpcUrl)
+    const keypair = Keypair.fromSecret(config.secretKey)
+    const account = await server.getAccount(config.sourceAccount)
+
+    const contract = new Contract(config.contractId)
+    const callOp = contract.call(
+      'stake_with_memo',
+      nativeToScVal(args.vaultId, { type: 'string' }),
+      nativeToScVal(args.amount, { type: 'string' }),
+      nativeToScVal(args.user, { type: 'string' }),
+      nativeToScVal(args.memo ?? undefined, { type: 'bytes' }),
+    )
+
+    const tx = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: config.networkPassphrase,
+    })
+      .addOperation(callOp)
+      .setTimeout(30)
+      .build()
+
+    const prepared = await server.prepareTransaction(tx)
+    prepared.sign(keypair)
+
+    const response = await server.sendTransaction(prepared)
+
+    if (response.status === 'ERROR') {
+      throw new Error(`Soroban sendTransaction failed: ${response.status}`)
+    }
+
+    let getResponse = await server.getTransaction(response.hash)
+    const maxAttempts = 30
+    let attempts = 0
+    while (getResponse.status === 'NOT_FOUND' && attempts < maxAttempts) {
+      await new Promise((r) => setTimeout(r, 1000))
+      getResponse = await server.getTransaction(response.hash)
+      attempts++
+    }
+
+    if (getResponse.status !== 'SUCCESS') {
+      throw new Error(`Soroban transaction did not succeed: ${getResponse.status}`)
+    }
+
+    return { txHash: response.hash }
+  },
 }
 
 // Allow overriding the client (for tests)
@@ -231,6 +299,59 @@ export const buildVaultStakePayload = async (
   try {
     log('info', 'soroban.submit_start', { vaultId: input.vaultId })
     const { txHash } = await _client.submitStake(config, payload.args)
+    log('info', 'soroban.submit_success', { vaultId: input.vaultId, txHash })
+
+    return {
+      mode,
+      payload,
+      submission: { attempted: true, status: 'success', txHash },
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown submission error'
+    log('error', 'soroban.submit_error', { vaultId: input.vaultId, error: message })
+
+    return {
+      mode,
+      payload,
+      submission: { attempted: true, status: 'error', error: message },
+    }
+  }
+}
+
+/**
+ * Builds the on-chain payload for staking with an optional memo.
+ * The memo is a hex-encoded Bytes payload bound to the vault funding
+ * event for off-chain correlation (e.g. tx idempotency key).
+ *
+ * Throws MemoTooLongError if the decoded memo exceeds MEMO_MAX_BYTES.
+ */
+export const buildVaultStakeWithMemoPayload = async (
+  input: StakeWithMemoInput,
+): Promise<StakeWithMemoResponse> => {
+  const mode = input.onChain?.mode ?? 'build'
+  const payload = buildStakeWithMemoPayload(input)
+
+  if (mode !== 'submit') {
+    return {
+      mode,
+      payload,
+      submission: { attempted: false, status: 'not_requested' },
+    }
+  }
+
+  const config = getSorobanConfig()
+  if (!config) {
+    log('warn', 'soroban.submit_not_configured', { vaultId: input.vaultId })
+    return {
+      mode,
+      payload,
+      submission: { attempted: true, status: 'not_configured' },
+    }
+  }
+
+  try {
+    log('info', 'soroban.submit_start', { vaultId: input.vaultId })
+    const { txHash } = await _client.submitStakeWithMemo(config, payload.args)
     log('info', 'soroban.submit_success', { vaultId: input.vaultId, txHash })
 
     return {
@@ -312,6 +433,39 @@ const buildStakePayload = (
     user: input.user,
   },
 })
+
+/**
+ * Validate memo length (hex-encoded bytes). Returns decoded byte count.
+ * Throws MemoTooLongError when the payload exceeds MEMO_MAX_BYTES.
+ */
+const validateMemo = (memo: string | undefined): number | undefined => {
+  if (memo === undefined || memo === '') return undefined
+  const hex = memo.startsWith('0x') ? memo.slice(2) : memo
+  const bytes = hex.length / 2
+  if (bytes > MEMO_MAX_BYTES) throw new MemoTooLongError(bytes, MEMO_MAX_BYTES)
+  return bytes
+}
+
+// ─── Build stake_with_memo payload ─────────────────────────────────────────
+
+const buildStakeWithMemoPayload = (
+  input: StakeWithMemoInput,
+): StakeWithMemoResponse['payload'] => {
+  validateMemo(input.memo)
+  return {
+    contractId: input.onChain?.contractId ?? process.env.SOROBAN_CONTRACT_ID ?? DEFAULT_CONTRACT_ID,
+    networkPassphrase:
+      input.onChain?.networkPassphrase ?? process.env.SOROBAN_NETWORK_PASSPHRASE ?? 'Test SDF Network ; September 2015',
+    sourceAccount: input.onChain?.sourceAccount ?? process.env.SOROBAN_SOURCE_ACCOUNT ?? DEFAULT_SOURCE_ACCOUNT,
+    method: 'stake_with_memo',
+    args: {
+      vaultId: input.vaultId,
+      amount: input.amount,
+      user: input.user,
+      memo: input.memo,
+    },
+  }
+}
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
