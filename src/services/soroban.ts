@@ -351,6 +351,7 @@ const buildPayload = (
       verifier: vault.verifier,
       successDestination: vault.successDestination,
       failureDestination: vault.failureDestination,
+      token: input.onChain?.token,
       milestones: vault.milestones.map((milestone) => ({
         id: milestone.id,
         title: milestone.title,
