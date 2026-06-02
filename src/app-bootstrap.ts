@@ -27,7 +27,7 @@ import {
   securityMetricsMiddleware,
   securityRateLimitMiddleware,
 } from './security/abuse-monitor.js'
-import { createNotificationService, type NotificationService } from './services/notifications/factory.js'
+import inFlightMiddleware from './middleware/inFlightRequests.js'
 
 type BootstrapOptions = {
   notificationService?: NotificationService
@@ -43,6 +43,8 @@ export function bootstrapApp(options: BootstrapOptions = {}) {
 
   app.use(securityMetricsMiddleware)
   app.use(securityRateLimitMiddleware)
+  // Track in-flight requests for graceful shutdown
+  app.use(inFlightMiddleware)
   app.use(withRequestPrisma)
 
   app.use('/api/health', healthRateLimiter, createHealthRouter(jobSystem))

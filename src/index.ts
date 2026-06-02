@@ -1,4 +1,4 @@
-import { initEnv } from './config/index.js'
+import { initEnv, getEnv } from './config/index.js'
 
 // Validate environment variables before any other initialisation.
 // This ensures the process exits immediately on misconfiguration.
@@ -27,7 +27,8 @@ import { createShutdownHandler } from './server/shutdown.js'
 import { getEnv } from './config/index.js'
 import { createNotificationService } from './services/notifications/factory.js'
 
-const PORT = process.env.PORT ?? 3000
+const env = getEnv()
+const PORT = env.PORT
 
 // Initialize SQLite database for analytics
 initializeDatabase()
@@ -38,12 +39,12 @@ const { jobSystem } = bootstrapApp({ notificationService })
 
 jobSystem.start()
 
-const ETL_INTERVAL_MINUTES = parseInt(process.env.ETL_INTERVAL_MINUTES ?? '5', 10)
+const ETL_INTERVAL_MINUTES = env.ETL_INTERVAL_MINUTES
 
 const server = app.listen(PORT, () => {
   console.log(`Disciplr API listening on http://localhost:${PORT}`)
   startExpirationChecker()
-  if (process.env.ENABLE_ETL_WORKER !== 'false') {
+  if (env.ENABLE_ETL_WORKER !== 'false') {
     etlWorker.start(ETL_INTERVAL_MINUTES)
   }
   void ensureSorobanBootPrecheck()

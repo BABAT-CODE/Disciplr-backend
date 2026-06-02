@@ -36,11 +36,12 @@ export class BackgroundJobSystem {
       notificationService ?? createNotificationService(process.env.NOTIFICATION_PROVIDER ?? 'console')
     const handlers = createDefaultJobHandlers(resolvedNotificationService)
 
-    this.queue.registerHandler('notification.send', handlers['notification.send'])
-    this.queue.registerHandler('deadline.check', handlers['deadline.check'])
-    this.queue.registerHandler('oracle.call', handlers['oracle.call'])
-    this.queue.registerHandler('analytics.recompute', handlers['analytics.recompute'])
-    this.queue.registerHandler('export.generate', handlers['export.generate'])
+    this.queue.registerHandler('notification.send', defaultJobHandlers['notification.send'])
+    this.queue.registerHandler('deadline.check', defaultJobHandlers['deadline.check'])
+    this.queue.registerHandler('oracle.call', defaultJobHandlers['oracle.call'])
+    this.queue.registerHandler('analytics.recompute', defaultJobHandlers['analytics.recompute'])
+    this.queue.registerHandler('export.generate', defaultJobHandlers['export.generate'])
+    this.queue.registerHandler('sessions.cleanup', defaultJobHandlers['sessions.cleanup'])
   }
 
   start(): void {
@@ -94,6 +95,13 @@ export class BackgroundJobSystem {
     return this.queue.replayDeadLetter(jobId)
   }
 
+  retryJob(jobId: string, force: boolean = false): QueuedJobReceipt<JobType> {
+    if (this.shuttingDown) {
+      throw new Error('Cannot retry job: system is shutting down')
+    }
+    return this.queue.retryJob(jobId, force)
+  }
+
   getMetrics(): QueueMetrics {
     return this.queue.getMetrics()
   }
@@ -111,6 +119,10 @@ export class BackgroundJobSystem {
       process.env.ANALYTICS_RECOMPUTE_INTERVAL_MS,
       300_000,
     )
+    const sessionsCleanupIntervalMs = parsePositiveInteger(
+      process.env.SESSIONS_CLEANUP_INTERVAL_MS,
+      86_400_000, // 24 hours
+    )
 
     this.enqueue('deadline.check', {
       triggerSource: 'scheduler',
@@ -123,6 +135,7 @@ export class BackgroundJobSystem {
       },
       { delayMs: 5_000 },
     )
+    this.enqueue('sessions.cleanup', {}, { delayMs: 10_000 })
 
     const deadlineTimer = setInterval(() => {
       this.enqueue('deadline.check', { triggerSource: 'scheduler' })
@@ -135,13 +148,20 @@ export class BackgroundJobSystem {
       })
     }, analyticsIntervalMs)
 
+    const sessionsTimer = setInterval(() => {
+      this.enqueue('sessions.cleanup', {})
+    }, sessionsCleanupIntervalMs)
+
     if (typeof deadlineTimer.unref === 'function') {
       deadlineTimer.unref()
     }
     if (typeof analyticsTimer.unref === 'function') {
       analyticsTimer.unref()
     }
+    if (typeof sessionsTimer.unref === 'function') {
+      sessionsTimer.unref()
+    }
 
-    this.scheduleTimers.push(deadlineTimer, analyticsTimer)
+    this.scheduleTimers.push(deadlineTimer, analyticsTimer, sessionsTimer)
   }
 }

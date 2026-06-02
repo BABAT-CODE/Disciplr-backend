@@ -22,6 +22,20 @@ export default [
     },
     rules: {
       ...tseslint.configs.recommended.rules,
+      'no-restricted-properties': [
+        'warn',
+        {
+          object: 'process',
+          property: 'env',
+          message: 'Use getEnv() from src/config/env.ts instead of accessing process.env directly.',
+        },
+      ],
+    },
+  },
+  {
+    files: ['src/config/env.ts'],
+    rules: {
+      'no-restricted-properties': 'off',
     },
   },
 ]
