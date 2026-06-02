@@ -64,10 +64,46 @@ addresses from the verifier set (or the optional oracle) have approved it.
 - The threshold must be ≥ 1 and ≤ `verifiers.len()`; otherwise `create_vault` returns
   `Error::InvalidThreshold`.
 
+### Vault State Machine
+
+```
+Draft ──stake──► Active ──admin_dispute──► Disputed
+  │                │                          │
+  │          claim/slash/withdraw         admin_resolve
+  │                │                      ↙    ↓    ↘
+  │           Completed               Active Completed Failed
+  │           Failed
+  └──withdraw──► Cancelled
+```
+
+Valid transitions:
+
+| From | To | Trigger |
+|------|-----|---------|
+| `Draft` | `Active` | `stake` / `stake_from` |
+| `Draft` | `Cancelled` | `withdraw` |
+| `Active` | `Completed` | `claim` (all milestones verified) |
+| `Active` | `Failed` | `slash_on_miss` (deadline passed) |
+| `Active` | `Cancelled` | `withdraw` (no check-ins yet) |
+| `Active` | `Disputed` | `admin_dispute` (guardian only) |
+| `Disputed` | `Active` | `admin_resolve` (guardian only) |
+| `Disputed` | `Completed` | `admin_resolve` (guardian only) |
+| `Disputed` | `Failed` | `admin_resolve` (guardian only) |
+
+`Completed`, `Failed`, and `Cancelled` are terminal states. `Disputed` is a non-terminal
+hold that blocks `slash_on_miss` and `claim` until the guardian resolves it.
+
 ### Arithmetic Safety
 
 The `create_vault` function validates that milestone amounts are positive and sum exactly to
 the declared `amount`, rejecting mismatches with `Error::AmountMismatch`.
+
+### Checked Milestone Access
+
+Contract code must not use `unwrap()` when reading milestones by caller-supplied indexes.
+Even when a nearby bounds check exists, use checked access such as
+`vault.milestones.get(index).ok_or(Error::MilestoneIndexOutOfRange)?` so future
+refactors continue to return typed contract errors instead of risking host-level panics.
 
 ### Error Types
 
@@ -95,6 +131,7 @@ the declared `amount`, rejecting mismatches with `Error::AmountMismatch`.
 | 20 | `NoVerifiers` | Empty verifier list |
 | 21 | `InvalidThreshold` | Threshold is 0 or exceeds verifier count |
 | 22 | `StakedRemaining` | Reclaim attempted while stake is non-zero |
+| 23 | `VaultDisputed` | Operation rejected because vault is in `Disputed` state |
 
 ### Performance & Gas Benchmarks
 
@@ -141,6 +178,21 @@ cd contracts/accountability_vault
 cargo test
 ```
 
+### Migration: API change (cancel_vault vs withdraw)
+
+- The contract API now exposes `cancel_vault(vault_id, creator)` for explicitly
+  cancelling an unfunded `Draft` vault. This path emits the `vault_cancelled`
+  event and performs no token transfers.
+- The `withdraw(vault_id, creator)` function has been restricted to the funded
+  `Active` refund case (vaults that were staked but never had any verified
+  check-ins). It performs a CEI-safe refund to the `creator` and emits
+  `vault_withdrawn`.
+- Backend callers must choose the appropriate method based on the vault's
+  current `status`: use `cancel_vault` for `Draft`, and `withdraw` for
+  `Active` refunding. The `vault_cancelled` topic and payload remain
+  compatible with the existing backend event parser.
+
+
 #### Formatting
 
 The workspace ships a `contracts/rustfmt.toml` config. Format all contract sources with:
@@ -174,6 +226,7 @@ The contract maintains comprehensive test coverage including:
 - Allowance-based staking (`stake_from`)
 - Oracle-driven milestone verification
 - Joint deadline extension (`extend_deadline`)
+- Disputed state: `admin_dispute` enters hold, `admin_resolve` returns to Active/Completed/Failed, `slash_on_miss` and `claim` blocked while disputed
 - Gas benchmarks with hard CPU/memory bounds
 
 ### Deployment
@@ -218,3 +271,4 @@ Location: `accountability_vault/src/lib.rs` — `AccountabilityVault::reclaim_af
 ### License
 
 See main repository license file.
+\n\nAdded milestone dispute functionality with configurable window.\n
