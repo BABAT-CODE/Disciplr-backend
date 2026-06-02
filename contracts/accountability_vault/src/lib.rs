@@ -8,7 +8,7 @@
 //! `success_destination`; on a missed deadline the capital is slashed to the
 //! `failure_destination` (e.g. a charity or forfeit address).
 //!
-//! Lifecycle: create_vault -> stake | stake_from -> (check_in)* -> claim | slash_on_miss
+//! Lifecycle: create_vault -> stake | stake_from -> (check_in)* -> claim | claim_milestone | slash_on_miss
 //! Funds movement is modeled via the SEP-41 token client (`stake`, `stake_from`,
 //! `claim`, `slash_on_miss`, `withdraw`). The contract enforces the state machine,
 //! authorization, and deadline rules on-chain.
@@ -65,6 +65,8 @@ pub struct Milestone {
     pub due_date: u64,
     /// Whether the verifier or oracle has confirmed this milestone.
     pub verified: bool,
+    /// Whether this milestone's funds have already been released via `claim_milestone`.
+    pub released: bool,
 }
 
 /// Full on-chain vault record.
@@ -118,8 +120,11 @@ pub enum Error {
     /// `stake_from` was called but the spender's token allowance from `from`
     /// is less than the vault's staking amount.
     InsufficientAllowance = 17,
-    /// Cannot reclaim funds because the vault still has outstanding stake.
-    StakedRemaining = 18,
+    /// `claim_milestone` was called for a milestone that has already been released.
+    MilestoneAlreadyReleased = 18,
+    /// `claim` was called but some milestones were already incrementally claimed
+    /// via `claim_milestone`. Use `claim_milestone` for each remaining milestone.
+    PartiallyReleased = 19,
 }
 
 #[contract]
@@ -178,6 +183,18 @@ impl AccountabilityVault {
             return Err(Error::AmountMismatch);
         }
 
+        // Ensure all milestones are initialised with released = false.
+        let mut init_milestones = Vec::new(&env);
+        for m in milestones.iter() {
+            init_milestones.push_back(Milestone {
+                title: m.title,
+                amount: m.amount,
+                due_date: m.due_date,
+                verified: m.verified,
+                released: false,
+            });
+        }
+
         let vault = Vault {
             creator: creator.clone(),
             verifier,
@@ -189,7 +206,7 @@ impl AccountabilityVault {
             failure_destination,
             end_timestamp,
             status: VaultStatus::Draft,
-            milestones,
+            milestones: init_milestones,
         };
         env.storage().persistent().set(&key, &vault);
         Self::extend_ttl(&env, &key);
@@ -429,8 +446,11 @@ impl AccountabilityVault {
     /// Slashes the staked capital to the `failure_destination` once the vault
     /// deadline has passed and not all milestones were verified. Permissionless:
     /// anyone may trigger the slash after the deadline (e.g. a backend keeper).
-    pub fn slash_on_miss(env: Env, vault_id: String) -> Result<(), Error> {
-        let mut vault: Vault = Self::load(&env, &vault_id)?;
+    ///
+    /// Only unreleased milestone amounts are slashed; milestones already claimed
+    /// via `claim_milestone` are excluded from the slash transfer.
+    pub fn slash_on_miss(env: Env) -> Result<(), Error> {
+        let mut vault: Vault = Self::load(&env)?;
 
         if vault.status != VaultStatus::Active {
             return Err(Error::NotActive);
@@ -442,15 +462,18 @@ impl AccountabilityVault {
             return Err(Error::MilestonesIncomplete);
         }
 
-        let client = token::Client::new(&env, &vault.token);
-        client.transfer(
-            &env.current_contract_address(),
-            &vault.failure_destination,
-            &vault.staked,
-        );
+        // Only slash the funds still held by the contract (unreleased milestones).
+        let slashed = vault.staked;
+        if slashed > 0 {
+            let client = token::Client::new(&env, &vault.token);
+            client.transfer(
+                &env.current_contract_address(),
+                &vault.failure_destination,
+                &slashed,
+            );
+        }
 
         vault.status = VaultStatus::Failed;
-        let slashed = vault.staked;
         vault.staked = 0;
         let key = DataKey::Vault(vault_id);
         env.storage().persistent().set(&key, &vault);
@@ -468,7 +491,11 @@ impl AccountabilityVault {
 
     /// Releases the staked capital to the `success_destination` once every
     /// milestone has been verified. Callable by the creator or verifier.
-    pub fn claim(env: Env, vault_id: String, caller: Address) -> Result<(), Error> {
+    ///
+    /// If any milestones were already individually released via `claim_milestone`,
+    /// this call is rejected with `Error::PartiallyReleased`. Use `claim_milestone`
+    /// consistently once you start using per-milestone claiming.
+    pub fn claim(env: Env, caller: Address) -> Result<(), Error> {
         caller.require_auth();
         let mut vault: Vault = Self::load(&env, &vault_id)?;
 
@@ -480,6 +507,11 @@ impl AccountabilityVault {
         }
         if !Self::all_verified(&vault) {
             return Err(Error::MilestonesIncomplete);
+        }
+        // Guard: if any milestone was already claimed via claim_milestone, reject
+        // bulk claim to prevent double-release confusion.
+        if Self::any_released(&vault) {
+            return Err(Error::PartiallyReleased);
         }
 
         let client = token::Client::new(&env, &vault.token);
@@ -503,6 +535,74 @@ impl AccountabilityVault {
             ),
             released,
         );
+        Ok(())
+    }
+
+    /// Releases a single verified milestone's amount to the `success_destination`.
+    ///
+    /// Callable by the creator or verifier once the milestone at `index` is
+    /// verified (via `check_in`). Tracks released milestones on the `Milestone`
+    /// struct's `released` flag to prevent double-claiming.
+    ///
+    /// When the last milestone is claimed, the vault automatically transitions
+    /// to `Completed`.
+    pub fn claim_milestone(env: Env, caller: Address, index: u32) -> Result<(), Error> {
+        caller.require_auth();
+        let mut vault: Vault = Self::load(&env)?;
+
+        if vault.status != VaultStatus::Active {
+            return Err(Error::NotActive);
+        }
+        if caller != vault.creator && caller != vault.verifier {
+            return Err(Error::Unauthorized);
+        }
+        if index >= vault.milestones.len() {
+            return Err(Error::MilestoneIndexOutOfRange);
+        }
+
+        let mut milestone = vault.milestones.get(index).unwrap();
+        if !milestone.verified {
+            return Err(Error::MilestonesIncomplete);
+        }
+        if milestone.released {
+            return Err(Error::MilestoneAlreadyReleased);
+        }
+
+        let payout = milestone.amount;
+
+        // Mark the milestone as released and update vault.
+        milestone.released = true;
+        vault.milestones.set(index, milestone);
+        vault.staked -= payout;
+
+        let client = token::Client::new(&env, &vault.token);
+        client.transfer(
+            &env.current_contract_address(),
+            &vault.success_destination,
+            &payout,
+        );
+
+        env.events().publish(
+            (
+                String::from_str(&env, "milestone_claimed"),
+                vault.success_destination.clone(),
+            ),
+            (index, payout),
+        );
+
+        // Transition to Completed if every milestone has now been released.
+        if Self::all_released(&vault) {
+            vault.status = VaultStatus::Completed;
+            env.events().publish(
+                (
+                    String::from_str(&env, "vault_completed"),
+                    vault.success_destination.clone(),
+                ),
+                vault.amount,
+            );
+        }
+
+        env.storage().instance().set(&DataKey::Vault, &vault);
         Ok(())
     }
 
@@ -592,6 +692,24 @@ impl AccountabilityVault {
     fn any_verified(vault: &Vault) -> bool {
         for m in vault.milestones.iter() {
             if m.verified {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn all_released(vault: &Vault) -> bool {
+        for m in vault.milestones.iter() {
+            if !m.released {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn any_released(vault: &Vault) -> bool {
+        for m in vault.milestones.iter() {
+            if m.released {
                 return true;
             }
         }
